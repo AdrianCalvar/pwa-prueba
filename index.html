@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prueba de persistencia</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<style>
+  body { font: 16px system-ui, sans-serif; margin: 0 auto; padding: 16px; max-width: 640px; }
+  h1 { font-size: 1.2rem } h2 { font-size: 1rem; margin-top: 1.4rem }
+  button { font: inherit; padding: 10px 14px; margin: 4px 4px 4px 0 }
+  pre { background: #8881; padding: 8px; overflow-x: auto; font-size: 12px; white-space: pre-wrap }
+</style>
+</head>
+<body>
+<h1>Prueba de persistencia</h1>
+<p>Página desechable. No guarda nada fuera de este dispositivo.</p>
+
+<h2>1. Entorno</h2>
+<pre id="env"></pre>
+<button id="persist">Pedir almacenamiento persistente</button>
+
+<h2>2. Registros guardados (prueba A y B)</h2>
+<p>Cada vez que abres esta página se añade un registro. El primero es el testigo: si desaparece, el navegador borró los datos.</p>
+<pre id="records"></pre>
+
+<h2>3. Grabación (prueba C)</h2>
+<button id="rec">Grabar</button><button id="stop" disabled>Parar</button>
+<button id="wake">Mantener pantalla encendida: no</button>
+<pre id="live"></pre>
+<p>Guion: «fase uno» en primer plano, bloquear o cambiar de app y decir «fase dos», volver y decir «fase tres».</p>
+
+<h2>4. Grabaciones recuperadas</h2>
+<pre id="sessions"></pre>
+
+<h2>5. Registro de eventos</h2>
+<pre id="events"></pre>
+<button id="copy">Copiar todo para pegarlo</button>
+
+<script>
+const $ = id => document.getElementById(id);
+const mode = matchMedia('(display-mode: standalone)').matches || navigator.standalone ? 'instalada' : 'navegador';
+let db;
+function open() {
+  return new Promise((ok, ko) => {
+    const r = indexedDB.open('prueba', 1);
+    r.onupgradeneeded = () => {
+      const d = r.result;
+      d.createObjectStore('records', { keyPath: 'id' });
+      d.createObjectStore('chunks', { autoIncrement: true });
+      d.createObjectStore('events', { autoIncrement: true });
+    };
+    r.onsuccess = () => ok(r.result); r.onerror = () => ko(r.error);
+  });
+}
+const tx = (s, m = 'readonly') => db.transaction(s, m).objectStore(s);
+const all = (s) => new Promise(ok => { const q = tx(s).getAll(); q.onsuccess = () => ok(q.result); });
+const put = (s, v) => new Promise(ok => { const q = tx(s, 'readwrite').add(v); q.onsuccess = () => ok(); q.onerror = () => ok(); });
+const now = () => new Date().toISOString();
+async function ev(text) { const e = { t: now(), mode, text }; await put('events', e); render(); }
+
+async function render() {
+  const rec = await all('records');
+  $('records').textContent = rec.length + ' registros\n' + rec.map((r, i) => (i === 0 ? '[testigo] ' : '') + r.t + '  ' + r.mode).join('\n');
+  const evs = await all('events');
+  $('events').textContent = evs.slice(-60).map(e => e.t + ' (' + e.mode + ') ' + e.text).join('\n');
+  const ch = await new Promise(ok => { const q = tx('chunks').getAll(); q.onsuccess = () => ok(q.result); });
+  const by = {};
+  ch.forEach(c => { (by[c.session] ||= { n: 0, bytes: 0, type: c.type, blobs: [] }); by[c.session].n++; by[c.session].bytes += c.blob.size; by[c.session].blobs.push(c.blob); });
+  $('sessions').textContent = Object.keys(by).length ? '' : 'ninguna';
+  Object.entries(by).forEach(([s, v]) => {
+    const line = document.createElement('div');
+    line.textContent = s + ': ' + v.n + ' trozos, ' + v.bytes + ' bytes ';
+    const b = document.createElement('button'); b.textContent = 'Analizar volumen';
+    b.onclick = async () => { b.disabled = true; line.append(await analyze(new Blob(v.blobs, { type: v.type }))); };
+    line.append(b); $('sessions').append(line);
+  });
+}
+
+async function analyze(blob) {
+  try {
+    const ctx = new (window.AudioContext || webkitAudioContext)();
+    const buf = await ctx.decodeAudioData(await blob.arrayBuffer());
+    const d = buf.getChannelData(0), sr = buf.sampleRate, out = [];
+    for (let s = 0; s * sr < d.length; s++) {
+      let sum = 0, n = 0;
+      for (let i = s * sr; i < Math.min((s + 1) * sr, d.length); i++) { sum += d[i] * d[i]; n++; }
+      out.push(Math.sqrt(sum / n));
+    }
+    const max = Math.max(...out, 0.0001);
+    return '\n' + out.map((r, i) => String(i).padStart(3) + 's ' + '#'.repeat(Math.round(r / max * 30)) + ' ' + r.toFixed(3)).join('\n') + '\n';
+  } catch (e) { return ' (no se pudo decodificar: ' + e.message + ')'; }
+}
+
+async function env() {
+  const est = navigator.storage?.estimate ? await navigator.storage.estimate() : {};
+  const persisted = navigator.storage?.persisted ? await navigator.storage.persisted() : 'n/d';
+  $('env').textContent = ['modo: ' + mode, 'persistente: ' + persisted, 'cuota usada/total: ' + est.usage + ' / ' + est.quota, navigator.userAgent].join('\n');
+}
+$('persist').onclick = async () => { const r = navigator.storage?.persist ? await navigator.storage.persist() : 'n/d'; await ev('persist() -> ' + r); env(); };
+
+let rec, track, session, wake;
+$('wake').onclick = async () => {
+  try {
+    if (wake) { await wake.release(); wake = null; $('wake').textContent = 'Mantener pantalla encendida: no'; return; }
+    wake = await navigator.wakeLock.request('screen'); $('wake').textContent = 'Mantener pantalla encendida: sí';
+  } catch (e) { await ev('wakeLock error ' + e.message); }
+};
+$('rec').onclick = async () => {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  track = stream.getAudioTracks()[0];
+  session = 'grab-' + now();
+  rec = new MediaRecorder(stream);
+  let n = 0, last = Date.now();
+  rec.ondataavailable = async e => {
+    n++; await put('chunks', { session, type: rec.mimeType, blob: e.data });
+    const gap = Math.round((Date.now() - last) / 1000); last = Date.now();
+    await ev('dataavailable #' + n + ' ' + e.data.size + ' bytes, hueco ' + gap + 's, estado ' + rec.state + ', muted=' + track.muted + ', readyState=' + track.readyState);
+  };
+  track.onmute = () => ev('track MUTE'); track.onunmute = () => ev('track UNMUTE'); track.onended = () => ev('track ENDED');
+  rec.start(2000);
+  await ev('grabación iniciada ' + session + ' tipo ' + rec.mimeType);
+  $('rec').disabled = true; $('stop').disabled = false;
+  $('live').textContent = 'grabando… ' + session;
+};
+$('stop').onclick = () => { rec.stop(); track.stop(); $('rec').disabled = false; $('stop').disabled = true; $('live').textContent = 'parada'; ev('grabación parada'); setTimeout(render, 500); };
+['visibilitychange', 'pagehide', 'pageshow', 'freeze', 'resume'].forEach(n => addEventListener(n, () => ev(n + ' visibilidad=' + document.visibilityState)));
+
+$('copy').onclick = async () => {
+  const txt = [$('env').textContent, $('records').textContent, $('events').textContent].join('\n\n');
+  try { await navigator.clipboard.writeText(txt); } catch { prompt('Copia esto', txt); }
+};
+
+(async () => {
+  db = await open();
+  const rec = await all('records');
+  await put('records', { id: crypto.randomUUID(), t: now(), mode });
+  await ev('apertura (' + rec.length + ' registros previos)');
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+  env(); render();
+})();
+</script>
+</body>
+</html>
