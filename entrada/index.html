@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prueba de entrada</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<style>
+  body { font: 17px system-ui, sans-serif; margin: 0 auto; padding: 16px; max-width: 640px; }
+  h1 { font-size: 1.25rem } h2 { font-size: 1.05rem; margin-top: 1.6rem }
+  button { font: inherit; padding: 12px 16px; margin: 4px 4px 4px 0; border-radius: 10px; }
+  input { font: 28px ui-monospace, monospace; letter-spacing: 6px; width: 9ch; padding: 8px; }
+  pre { background: #8881; padding: 8px; overflow-x: auto; font-size: 12px; white-space: pre-wrap }
+  .ok { color: #1a7f37 } .ko { color: #c4302b }
+  .code { font: 32px ui-monospace, monospace; letter-spacing: 6px }
+</style>
+</head>
+<body>
+<h1>Prueba de entrada</h1>
+<p>Página desechable. No envía nada a ningún servidor: todo queda en este móvil.</p>
+
+<h2>1. Entorno</h2>
+<pre id="env">Comprobando…</pre>
+
+<h2>2. Crear passkey</h2>
+<p>Pide Face ID o huella y guarda una llave para esta página.</p>
+<button id="create">Crear passkey</button>
+<pre id="createOut"></pre>
+
+<h2>3. Entrar con passkey</h2>
+<p>Hazlo en la app instalada y, después, abriendo esta misma dirección en Safari (o Chrome).</p>
+<button id="get">Entrar con passkey</button>
+<pre id="getOut"></pre>
+
+<h2>4. Simulacro del código por correo</h2>
+<p>Pulsa el botón, sal a la app Mail (o a cualquier otra) unos 20 segundos y vuelve aquí. Al volver aparecerá el código que «llegó» al correo; escríbelo en la casilla.</p>
+<button id="sim">Pedir código</button>
+<div id="simBox" hidden>
+  <p id="simMsg"></p>
+  <input id="otp" inputmode="numeric" autocomplete="one-time-code" maxlength="6" aria-label="Código">
+  <button id="check">Comprobar</button>
+</div>
+<pre id="simOut"></pre>
+
+<h2>5. Resultados</h2>
+<p>Pulsa y pégalo en el chat o en el ticket.</p>
+<button id="copy">Copiar resultados</button>
+<button id="reset">Borrar resultados</button>
+<pre id="log"></pre>
+
+<script>
+const $ = id => document.getElementById(id);
+const mode = matchMedia('(display-mode: standalone)').matches || navigator.standalone ? 'instalada' : 'navegador';
+const LOG = 'entrada-log', SIM = 'entrada-sim';
+const store = {
+  get: (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d } catch { return d } },
+  set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)) } catch {} },
+};
+const now = () => new Date().toLocaleTimeString('es-ES');
+function log(msg) {
+  const l = store.get(LOG, []);
+  l.push(`${now()} [${mode}] ${msg}`);
+  store.set(LOG, l);
+  $('log').textContent = l.join('\n');
+}
+const b64 = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const rand = n => crypto.getRandomValues(new Uint8Array(n));
+
+// Bits del byte de flags de authenticatorData (posición 32).
+function flags(authData) {
+  const f = new Uint8Array(authData)[32];
+  return {
+    verificado: !!(f & 0x04),           // Face ID / huella / código del móvil
+    sincronizable: !!(f & 0x08),        // BE: puede copiarse al llavero en la nube
+    sincronizada: !!(f & 0x10),         // BS: ya está copiada
+  };
+}
+const fmtFlags = f => `persona verificada: ${f.verificado ? 'sí' : 'no'} · sincronizable: ${f.sincronizable ? 'sí' : 'no'} · sincronizada en la nube: ${f.sincronizada ? 'sí' : 'no'}`;
+
+async function env() {
+  const lines = [
+    `Modo: ${mode}`,
+    `Navegador: ${navigator.userAgent}`,
+    `Dominio: ${location.hostname}`,
+  ];
+  const pk = 'PublicKeyCredential' in window;
+  lines.push(`WebAuthn: ${pk ? 'sí' : 'no'}`);
+  if (pk) {
+    try { lines.push(`Autenticador del móvil (Face ID/huella): ${await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable() ? 'sí' : 'no'}`) } catch (e) { lines.push(`Autenticador del móvil: error ${e.name}`) }
+    if (PublicKeyCredential.isConditionalMediationAvailable) {
+      try { lines.push(`Autorrelleno de passkey: ${await PublicKeyCredential.isConditionalMediationAvailable() ? 'sí' : 'no'}`) } catch {}
+    }
+  }
+  const saved = store.get('entrada-cred', null);
+  lines.push(`Passkey creada antes en este modo: ${saved ? 'sí (' + saved.cuando + ', ' + saved.modo + ')' : 'no'}`);
+  $('env').textContent = lines.join('\n');
+  log('Abierta. ' + lines.slice(0, 1).concat(lines.slice(3)).join(' | '));
+}
+
+$('create').onclick = async () => {
+  $('createOut').textContent = 'Esperando…';
+  try {
+    const cred = await navigator.credentials.create({ publicKey: {
+      challenge: rand(32),
+      rp: { name: 'Ecos (prueba)' },
+      user: { id: rand(16), name: `prueba-${new Date().toISOString().slice(0, 16)}`, displayName: 'Prueba Ecos' },
+      pubKeyCredParams: [{ type: 'public-key', alg: -7 }, { type: 'public-key', alg: -257 }],
+      authenticatorSelection: { residentKey: 'required', userVerification: 'required' },
+      timeout: 120000,
+    }});
+    const f = flags(cred.response.getAuthenticatorData());
+    const id = b64(cred.rawId);
+    store.set('entrada-cred', { id, cuando: now(), modo: mode });
+    const msg = `Creada. Tipo: ${cred.authenticatorAttachment || '?'} · ${fmtFlags(f)} · id ${id.slice(0, 10)}…`;
+    $('createOut').innerHTML = `<span class="ok">✔</span> ${msg}`;
+    log('CREAR passkey OK. ' + msg);
+  } catch (e) {
+    $('createOut').innerHTML = `<span class="ko">✘</span> ${e.name}: ${e.message}`;
+    log(`CREAR passkey FALLA. ${e.name}: ${e.message}`);
+  }
+};
+
+$('get').onclick = async () => {
+  $('getOut').textContent = 'Esperando…';
+  try {
+    const cred = await navigator.credentials.get({ publicKey: {
+      challenge: rand(32), userVerification: 'required', timeout: 120000,
+    }});
+    const f = flags(cred.response.authenticatorData);
+    const id = b64(cred.rawId);
+    const saved = store.get('entrada-cred', null);
+    const same = saved ? (saved.id === id ? 'la misma creada aquí' : 'otra distinta a la creada aquí') : 'creada en otro sitio (normal en Safari si se creó en la app)';
+    const msg = `Entrada OK. Tipo: ${cred.authenticatorAttachment || '?'} · ${fmtFlags(f)} · llave: ${same}`;
+    $('getOut').innerHTML = `<span class="ok">✔</span> ${msg}`;
+    log('ENTRAR passkey OK. ' + msg);
+  } catch (e) {
+    $('getOut').innerHTML = `<span class="ko">✘</span> ${e.name}: ${e.message}`;
+    log(`ENTRAR passkey FALLA. ${e.name}: ${e.message}`);
+  }
+};
+
+// Simulacro: detecta si al salir y volver la app sigue donde estaba o se recarga.
+let leftAt = null;
+function showSim(s) {
+  $('simBox').hidden = false;
+  $('simMsg').innerHTML = s.away ? `El correo dice: <span class="code">${s.code}</span>` : 'Ahora sal a Mail y vuelve.';
+}
+$('sim').onclick = () => {
+  const s = { code: String(crypto.getRandomValues(new Uint32Array(1))[0] % 1e6).padStart(6, '0'), pedido: Date.now(), away: false, pageId };
+  store.set(SIM, s);
+  $('otp').value = '';
+  $('simOut').textContent = '';
+  showSim(s);
+  log('SIMULACRO: código pedido.');
+};
+document.addEventListener('visibilitychange', () => {
+  const s = store.get(SIM, null);
+  if (!s || s.fin) return;
+  if (document.hidden) { leftAt = Date.now(); return; }
+  if (leftAt) {
+    const secs = Math.round((Date.now() - leftAt) / 1000);
+    s.away = true; s.fuera = secs; store.set(SIM, s);
+    log(`SIMULACRO: vuelve tras ${secs} s. La página NO se recargó.`);
+    showSim(s);
+  }
+});
+$('check').onclick = () => {
+  const s = store.get(SIM, null);
+  if (!s) return;
+  const ok = $('otp').value === s.code;
+  s.fin = true; store.set(SIM, s);
+  const msg = ok ? 'Código correcto.' : `Código distinto (escrito ${$('otp').value || 'nada'}).`;
+  $('simOut').innerHTML = `<span class="${ok ? 'ok' : 'ko'}">${ok ? '✔' : '✘'}</span> ${msg}`;
+  log('SIMULACRO: ' + msg + (s.recargada ? ' (tras recargarse)' : ''));
+};
+
+// Si había un simulacro a medias y esta es otra carga, la app se recargó al volver.
+const pageId = Math.random().toString(36).slice(2);
+(function resumeSim() {
+  const s = store.get(SIM, null);
+  if (!s || s.fin || s.pageId === pageId) return;
+  s.away = true; s.recargada = true; s.pageId = pageId; store.set(SIM, s);
+  log(`SIMULACRO: la app SE RECARGÓ al volver (${Math.round((Date.now() - s.pedido) / 1000)} s desde que se pidió). El código seguía guardado.`);
+  showSim(s);
+})();
+
+$('copy').onclick = async () => {
+  const text = $('env').textContent + '\n\n' + store.get(LOG, []).join('\n');
+  try { await navigator.clipboard.writeText(text); $('copy').textContent = 'Copiado ✔' } catch { $('copy').textContent = 'No se pudo: selecciona el texto a mano' }
+};
+$('reset').onclick = () => { store.set(LOG, []); localStorage.removeItem(SIM); localStorage.removeItem('entrada-cred'); $('log').textContent = ''; env(); };
+
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
+$('log').textContent = store.get(LOG, []).join('\n');
+env();
+</script>
+</body>
+</html>
